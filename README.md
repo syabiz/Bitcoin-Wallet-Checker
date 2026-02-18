@@ -661,4 +661,44 @@ Selamat belajar! 🚀
 
 ---
 
+## DONASI
+
+Jika tool ini bermanfaat untuk edukasi dan pembelajaran Anda, donasi sangat dihargai:
+
+**Bitcoin (BTC):** `bc1qn6t8hy8memjfzp4y3sh6fvadjdtqj64vfvlx58`
+
+**Ethereum (ETH):** `0x512936ca43829C8f71017aE47460820Fe703CAea`
+
+**PayPal:** `syabiz@yandex.com`
+
+Donasi akan digunakan untuk pengembangan fitur baru, maintenance server, dan dokumentasi.
+
+---
+
+## KONTAK
+
+- **GitHub Issues:** https://github.com/username/bitcoin-legacy-recovery/issues
+- **Email:** syabiz@yandex.com
+- **Twitter:** @syabiz
+
+---
+
+## UCAPAN TERIMA KASIH
+
+- **Komunitas Bitcoin** — Untuk dokumentasi dan spesifikasi teknis
+- **Pengembang ecdsa** — Library kriptografi yang luar biasa
+- **Pengembang base58** — Encoding/decoding yang efisien
+- **Semua kontributor** — Yang membantu meningkatkan tool ini
+- **Para pengguna** — Untuk feedback dan saran berharga
+
+---
+
+Terima kasih telah menggunakan Bitcoin Legacy Address Recovery Tool! 🚀
+
+*Dibuat dengan ❤️ untuk edukasi dan pembelajaran Bitcoin*
+
+*Terakhir diperbarui: 19 Februari 2026*
+
+---
+
 *Dibuat untuk keperluan edukasi internal. Harap digunakan secara bertanggung jawab.*

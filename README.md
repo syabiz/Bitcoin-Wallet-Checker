@@ -1,0 +1,708 @@
+# 📘 README — Bitcoin wallet.dat Password Checker
+
+> *Bitcoin & Litecoin · HashCat Format · SHA-512 + AES-256-CBC*
+> Enter the hash in HashCat format `"$bitcoin$..."` and the password you want to verify. The entire process runs in the browser (client-side).
+
+> **Internal Educational Material**
+> Suitable for: cryptography students, digital forensics teams, blockchain developers
+
+---
+
+## 📋 Table of Contents
+
+1. [What Is This Tool?](#1-what-is-this-tool)
+2. [Background: How Bitcoin Core Stores Passwords?](#2-background-how-bitcoin-core-stores-passwords)
+3. [HashCat Hash Format ($bitcoin$)](#3-hashcat-hash-format-bitcoin)
+4. [Verification Workflow — Step by Step](#4-verification-workflow--step-by-step)
+5. [KDF: Iterative SHA-512 (The Core of Everything)](#5-kdf-iterative-sha-512-the-core-of-everything)
+6. [AES-256-CBC Encryption](#6-aes-256-cbc-encryption)
+7. [PKCS7 Padding Validation](#7-pkcs7-padding-validation)
+8. [Common Mistakes & Fixed Bugs](#8-common-mistakes--fixed-bugs)
+9. [How to Extract the Hash from wallet.dat](#9-how-to-extract-the-hash-from-walletdat)
+10. [Code Explanation per Function](#10-code-explanation-per-function)
+11. [Comparison: Iterative SHA-512 vs PBKDF2 vs scrypt](#11-comparison-iterative-sha-512-vs-pbkdf2-vs-scrypt)
+12. [Security & Ethical Use](#12-security--ethical-use)
+13. [References & Further Reading](#13-references--further-reading)
+
+---
+
+## 1. What Is This Tool?
+
+This tool is a **password verifier** for `wallet.dat` files belonging to Bitcoin Core (and Litecoin Core). It runs entirely in the **browser** (client-side) — no data is sent to any server.
+
+**Primary function:**
+Accepts a hash in HashCat format (`$bitcoin$...`) and a password, then verifies whether the password is correct or not — **without needing to open the original wallet.dat file**.
+
+**Who uses it?**
+- Wallet owners who forgot their password and want to verify candidate passwords
+- Digital forensics teams
+- Security researchers studying Bitcoin wallet cryptography
+- Students who want to understand how wallet encryption works
+
+---
+
+## 2. Background: How Bitcoin Core Stores Passwords?
+
+When you encrypt a wallet in Bitcoin Core, the program does not directly encrypt your private key with your password. There are several layers:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    WALLET ENCRYPTION ARCHITECTURE            │
+│                                                             │
+│  PASSWORD (plaintext from user)                             │
+│       │                                                     │
+│       ▼                                                     │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │  KDF: Iterative SHA-512 + Salt (N iterations)       │   │
+│  │  → Produces: Key (32 bytes) + IV (16 bytes)         │   │
+│  └─────────────────────────────────────────────────────┘   │
+│       │                                                     │
+│       ▼                                                     │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │  AES-256-CBC Decryption of Encrypted Master Key     │   │
+│  └─────────────────────────────────────────────────────┘   │
+│       │                                                     │
+│       ▼                                                     │
+│  Master Key (plaintext) → used to encrypt                  │
+│  all Private Keys inside the wallet                         │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Key Concepts:**
+- **Master Key**: The primary secret key used to encrypt private keys. The master key itself is encrypted using the user's password.
+- **Salt**: Random data added before the hashing process. Its purpose is to prevent rainbow table attacks.
+- **Iterations (N)**: How many times the SHA-512 process is repeated. The larger N is, the slower brute-force attacks become.
+- **IV (Initialization Vector)**: The initial value for CBC mode. It is derived from the KDF, not stored separately.
+
+---
+
+## 3. HashCat Hash Format ($bitcoin$)
+
+The hash is generated by the `bitcoin2john.py` tool (from the John the Ripper package) which reads the `wallet.dat` file.
+
+### Format Structure
+
+```
+$bitcoin$<mkHexLen>$<mkHex>$<saltHexLen>$<saltHex>$<iterations>$<f1>$<f2>$<f3>$<f4>
+```
+
+### Field Description Table
+
+| Position | Field Name   | Type    | Description                                                  |
+|----------|-------------|---------|--------------------------------------------------------------|
+| [0]      | `mkHexLen`  | integer | **Length of the hex STRING** of masterKey (not byte count!) |
+| [1]      | `mkHex`     | hex     | Encrypted Master Key (in hex format)                        |
+| [2]      | `saltHexLen`| integer | **Length of the hex STRING** of salt (not byte count!)      |
+| [3]      | `saltHex`   | hex     | Salt in hex format                                           |
+| [4]      | `iterations`| integer | Number of SHA-512 iterations                                 |
+| [5..8]   | (extra)     | -       | Additional fields, not used in basic verification            |
+
+### Real Hash Example
+
+```
+$bitcoin$64$617c4b22fabd578e0f4d030245a0cbebd9da426fbee49c2feb885fa190b65096$16$dff2b89e4d885c28$35714$2$00$2$00
+```
+
+Broken down:
+```
+Prefix      : $bitcoin$
+mkHexLen    : 64       → mkHex is 64 hex chars long = 32 bytes
+mkHex       : 617c4b22fabd578e0f4d030245a0cbebd9da426fbee49c2feb885fa190b65096
+saltHexLen  : 16       → saltHex is 16 hex chars long = 8 bytes
+saltHex     : dff2b89e4d885c28
+iterations  : 35714
+```
+
+### ⚠️ Common Pitfall — mkHexLen Is NOT a Byte Count!
+
+This is the **most common mistake** made by implementors:
+
+```
+WRONG ❌:  expected_length = mkHexLen * 2
+           → 64 * 2 = 128 hex chars (incorrect!)
+
+CORRECT ✅:  expected_length = mkHexLen
+             → 64 hex chars (correct!)
+```
+
+Why is this wrong? Because people assume `mkHexLen` is the **number of bytes**, but it is actually the **number of hex characters**. 1 byte = 2 hex characters. So `mkHexLen=64` means 64 hex characters = 32 bytes.
+
+---
+
+## 4. Verification Workflow — Step by Step
+
+```
+INPUT: hash ($bitcoin$...) + password (text)
+           │
+           ▼
+┌─────────────────────────────┐
+│  STEP 1: Parse Hash         │
+│  Extract: mkHex, saltHex,   │
+│  iterations                 │
+└─────────────┬───────────────┘
+              │
+              ▼
+┌─────────────────────────────┐
+│  STEP 2: KDF                │
+│  Iterative SHA-512          │
+│  Input: password + salt     │
+│  Repeat N times             │
+│  Output: 64 bytes           │
+│  → key = byte[0..31]        │
+│  → iv  = byte[32..47]       │
+└─────────────┬───────────────┘
+              │
+              ▼
+┌─────────────────────────────┐
+│  STEP 3: AES Decryption     │
+│  AES-256-CBC                │
+│  Key = 32 bytes from KDF    │
+│  IV  = 16 bytes from KDF    │
+│  Data = mkHex[0..31] (32b)  │
+│  Output: plaintext 32 bytes │
+└─────────────┬───────────────┘
+              │
+              ▼
+┌─────────────────────────────┐
+│  STEP 4: Check Padding      │
+│  PKCS7: last byte = N?      │
+│  Last N bytes all = N?      │
+└─────────────┬───────────────┘
+              │
+        ┌─────┴──────┐
+        ▼            ▼
+   VALID ✅      NOT VALID ❌
+  "Password    "Password
+   Correct!"    Incorrect!"
+```
+
+---
+
+## 5. KDF: Iterative SHA-512 (The Core of Everything)
+
+KDF = **Key Derivation Function** — a function to derive a cryptographic key from a plaintext password.
+
+### Bitcoin Core Algorithm (crypter.cpp)
+
+```
+ROUND 1:
+  data  = bytes(password) + bytes(salt)
+  hash  = SHA-512(data)           ← 64 bytes output
+
+ROUND 2 through N:
+  hash  = SHA-512(hash)           ← only the previous hash!
+
+FINAL RESULT (64 bytes):
+  key = hash[0 .. 31]             ← 32 bytes for AES-256
+  iv  = hash[32 .. 47]            ← 16 bytes for AES CBC
+```
+
+### JavaScript Implementation (Web Crypto API)
+
+```javascript
+async function deriveKeyBitcoinSHA512(password, saltBytes, iterations) {
+    const passBytes = new TextEncoder().encode(password);
+
+    // Combine password + salt into one array
+    const combined = new Uint8Array(passBytes.length + saltBytes.length);
+    combined.set(passBytes, 0);
+    combined.set(saltBytes, passBytes.length);
+
+    // Round 1: SHA-512(password + salt)
+    let hashBuf = await crypto.subtle.digest('SHA-512', combined);
+
+    // Round 2 through N: SHA-512(previous hash)
+    for (let i = 1; i < iterations; i++) {
+        hashBuf = await crypto.subtle.digest('SHA-512', hashBuf);
+    }
+
+    return new Uint8Array(hashBuf); // 64 bytes
+}
+```
+
+### Iteration Visualization
+
+```
+Iteration  Input                        Output
+────────── ──────────────────────────── ──────────────────────────────
+1          SHA-512(password + salt)  →  hash₁  (64 bytes)
+2          SHA-512(hash₁)            →  hash₂  (64 bytes)
+3          SHA-512(hash₂)            →  hash₃  (64 bytes)
+...        ...                          ...
+N          SHA-512(hash_{N-1})       →  hashₙ  (64 bytes) ← final result
+
+key = hashₙ[0..31]   (32 bytes)
+iv  = hashₙ[32..47]  (16 bytes)
+```
+
+### Why Are Iterations Needed?
+
+Without iterations, an attacker could try millions of passwords per second on modern GPUs. With `iterations = 35714`, each password attempt requires 35,714 SHA-512 computations. This significantly slows down brute-force attacks.
+
+> **Analogy:** Like locking a door not with just one key, but with 35,714 keys that must all be unlocked one by one in sequence.
+
+---
+
+## 6. AES-256-CBC Encryption
+
+### AES (Advanced Encryption Standard)
+
+AES is the industry-standard symmetric encryption algorithm. Symmetric means the same key is used for both encryption and decryption.
+
+- **AES-256**: Uses a 256-bit (32-byte) key
+- **CBC (Cipher Block Chaining)**: An operation mode that chains data blocks together
+
+### How CBC Works
+
+```
+ENCRYPTION:
+  Plaintext₁  XOR  IV   → AES(key) → Ciphertext₁
+  Plaintext₂  XOR  C₁   → AES(key) → Ciphertext₂
+  Plaintext₃  XOR  C₂   → AES(key) → Ciphertext₃
+
+DECRYPTION (the reverse):
+  AES_decrypt(key, C₁) XOR IV  → Plaintext₁
+  AES_decrypt(key, C₂) XOR C₁ → Plaintext₂
+  AES_decrypt(key, C₃) XOR C₂ → Plaintext₃
+```
+
+### Why Is IV Important?
+
+The IV (Initialization Vector) ensures that the same plaintext will produce different ciphertext each time it is encrypted (as long as the IV differs). This prevents pattern analysis.
+
+In Bitcoin Core, the IV is **not stored separately** — instead, it is regenerated from the KDF each time it is needed. This is why we only need the password and salt to decrypt.
+
+### JavaScript Implementation
+
+```javascript
+const decrypted = CryptoJS.AES.decrypt(
+    { ciphertext: uint8ToWordArray(cipherBytes) },  // encrypted data
+    uint8ToWordArray(key),                           // 32-byte key
+    {
+        iv:      uint8ToWordArray(iv),               // 16-byte IV
+        mode:    CryptoJS.mode.CBC,                  // CBC mode
+        padding: CryptoJS.pad.NoPadding              // padding handled manually
+    }
+);
+```
+
+---
+
+## 7. PKCS7 Padding Validation
+
+### Why Is Padding Needed?
+
+AES-CBC operates on 16-byte blocks. If the plaintext is not a multiple of 16, padding (extra bytes) must be added to make it fit.
+
+### PKCS7 Scheme
+
+```
+If data needs N more bytes to be a multiple of 16:
+  Add N bytes, each with value N
+
+Example:
+  Data = 13 bytes → 3 bytes short
+  Padding: 03 03 03
+  Complete data = [original data] 03 03 03
+
+Special case: Data is already a multiple of 16:
+  Padding = one full block: 10 10 10 10 10 10 10 10 10 10 10 10 10 10 10 10
+  (0x10 = 16 in decimal)
+```
+
+### Validation Logic in Code
+
+```javascript
+const last = decryptedBytes[decryptedBytes.length - 1]; // get last byte
+
+let isValid = (last >= 1 && last <= 16); // value must be 1-16
+
+if (isValid) {
+    // Check: are the last `last` bytes all equal to `last`?
+    for (let i = decryptedBytes.length - last; i < decryptedBytes.length; i++) {
+        if (decryptedBytes[i] !== last) {
+            isValid = false;
+            break;
+        }
+    }
+}
+```
+
+### Why Padding Becomes a Verification Tool?
+
+If the password is **correct** → decryption produces the original plaintext → PKCS7 padding is valid.
+If the password is **wrong** → decryption produces random data → padding will very likely be invalid.
+
+```
+Correct Password:
+  Plaintext: [master key data...]  10 10 10 10 10 10 10 10 10 10 10 10 10 10 10 10
+                                    ↑ all 0x10 → PKCS7 valid ✅
+
+Wrong Password:
+  Decryption result (random): [noise...] 7a 3f b2 91 ...
+                                          ↑ no padding pattern → NOT valid ❌
+```
+
+> **Note:** There is a small chance (1/256 per byte) that random data happens to form a valid padding. This is called a "false positive" and is very rare in practice.
+
+---
+
+## 8. Common Mistakes & Fixed Bugs
+
+Below are four critical bugs found and fixed during the development of this tool. These are valuable lessons for anyone implementing something similar.
+
+---
+
+### Bug #1 — Helper Functions Not Implemented
+
+**Problem:**
+```javascript
+// Old code (BROKEN):
+function hexToBytes(hex) { /* ... */ }      // ← empty!
+function bytesToHex(bytes) { /* ... */ }    // ← empty!
+function uint8ToWordArray(u8) { /* ... */ } // ← empty!
+function wordArrayToUint8(wa) { /* ... */ } // ← empty!
+```
+
+These functions were called throughout the code but were never implemented. As a result, the tool immediately errored on first run.
+
+**Fix:** Implement all conversion functions correctly.
+
+---
+
+### Bug #2 — `mkHexLen` Misinterpreted (Cause of User Errors)
+
+**Problem:**
+```javascript
+// Old code (WRONG):
+if (masterKeyHex.length !== mkLen * 2) {  // ← this multiplication by 2 is INCORRECT
+    throw new Error("masterKey length mismatch...");
+}
+
+// For hash: $bitcoin$64$...
+// mkLen = 64
+// Old code expected: 64 * 2 = 128 hex chars
+// But mkHex is only 64 chars → ERROR!
+```
+
+**In-depth explanation:**
+
+In the bitcoin2john format, the number after `$bitcoin$` is the **hex string length**, not the byte count. Most programmers incorrectly assume it is a byte count and multiply by 2 (because 1 byte = 2 hex chars).
+
+```
+Format: $bitcoin$64$[64 hex characters]...
+                 ↑
+                 This = 64 hex characters = 32 bytes
+                 NOT = 64 bytes = 128 hex characters!
+```
+
+**Fix:**
+```javascript
+// New code (CORRECT):
+if (masterKeyHex.length !== mkHexLen) {  // ← compare directly, without *2
+    throw new Error(`mkHex length mismatch...`);
+}
+```
+
+---
+
+### Bug #3 — Using scrypt Instead of SHA-512 (Most Serious Logic Bug)
+
+**Problem:**
+
+The old code used the `scrypt-js` library for key derivation:
+
+```javascript
+// Old code (WRONG):
+const derivedBytes = await scrypt.scrypt(
+    new TextEncoder().encode(password),
+    saltBytes,
+    N, r, p, dkLen   // scrypt parameters
+);
+```
+
+**Why is this wrong?**
+
+Bitcoin Core **does not use scrypt** for standard wallet encryption. Bitcoin Core uses **iterative SHA-512**, which is much simpler (see `src/wallet/crypter.cpp`).
+
+scrypt is indeed used in some Bitcoin-related contexts (for example: Litecoin mining, some BIP39 implementations), but **not** for default wallet.dat encryption.
+
+The result of this bug: the tool always returned "Wrong Password" even when the entered password was 100% correct. This is an extremely dangerous bug because it shows no error — it just returns the wrong result.
+
+**Comparison:**
+
+| Aspect            | scrypt                          | Iterative SHA-512 (Bitcoin Core)        |
+|-------------------|---------------------------------|-----------------------------------------|
+| Function          | `scrypt(pass, salt, N, r, p)`   | `SHA512(SHA512(...SHA512(pass+salt)))` |
+| Complexity        | High (memory-hard)              | Simple                                  |
+| Used in           | Litecoin mining, some BIP39     | Bitcoin Core wallet encryption          |
+| Output            | Variable length                 | Fixed 64 bytes                          |
+
+**Fix:**
+```javascript
+// New code (CORRECT):
+async function deriveKeyBitcoinSHA512(password, saltBytes, iterations) {
+    const combined = combine(password_bytes + salt_bytes);
+    let hash = SHA512(combined);              // round 1
+    for (let i = 1; i < iterations; i++) {
+        hash = SHA512(hash);                  // round 2..N
+    }
+    return hash; // key=hash[0..31], iv=hash[32..47]
+}
+```
+
+---
+
+### Bug #4 — Padding Validation Using XOR (Incorrect Logic)
+
+**Problem:**
+```javascript
+// Old code (WRONG):
+const xorResult = new Uint8Array(16);
+for (let i = 0; i < 16; i++) {
+    xorResult[i] = decryptedBytes[i] ^ masterKeyBytes[i]; // XOR with IV!
+}
+// Check if all bytes = 0x10
+let isValid = xorResult.every(b => b === 0x10);
+```
+
+This logic has no technical basis. XORing the decryption result with the wallet IV does not produce useful information for validation.
+
+**Fix:** Use the standard PKCS7 validation described in Section 7.
+
+---
+
+## 9. How to Extract the Hash from wallet.dat
+
+To use this tool, you first need to extract the hash from the `wallet.dat` file.
+
+### Using bitcoin2john.py
+
+```bash
+# Install dependencies
+pip install bsddb3
+
+# Extract hash
+python bitcoin2john.py /path/to/wallet.dat
+```
+
+The output will look like:
+```
+wallet.dat:$bitcoin$64$xxxxx$16$xxxxx$25000$2$00$2$00
+```
+
+The part after `:` is the hash to be entered into this tool.
+
+### Using Hashcat to Crack (Educational Reference)
+
+```bash
+# Mode -m 11300 = Bitcoin/Litecoin wallet.dat
+hashcat -m 11300 hash.txt wordlist.txt
+
+# With rules
+hashcat -m 11300 hash.txt wordlist.txt -r rules/best64.rule
+```
+
+> **Important:** Use only on your own wallet or with explicit written permission from the owner.
+
+---
+
+## 10. Code Explanation per Function
+
+### `hexToBytes(hex)` — Hex to Byte Conversion
+
+```javascript
+function hexToBytes(hex) {
+    // Example input:  "dff2b89e"
+    // Example output: Uint8Array([0xdf, 0xf2, 0xb8, 0x9e])
+
+    hex = hex.replace(/\s+/g, '');  // remove whitespace
+    const bytes = new Uint8Array(hex.length / 2);
+    for (let i = 0; i < bytes.length; i++) {
+        bytes[i] = parseInt(hex.substr(i * 2, 2), 16);
+        //         ↑ take 2 characters, parse as hex
+    }
+    return bytes;
+}
+```
+
+### `uint8ToWordArray(u8)` — Conversion for CryptoJS
+
+CryptoJS uses an internal `WordArray` format (array of 32-bit integers, big-endian). This function converts a standard `Uint8Array` to that format.
+
+```javascript
+function uint8ToWordArray(u8) {
+    const words = [];
+    for (let i = 0; i < u8.length; i += 4) {
+        // Combine 4 bytes into 1 32-bit integer (big-endian)
+        words.push(
+            ((u8[i]   || 0) << 24) |  // first byte  → bits 31-24
+            ((u8[i+1] || 0) << 16) |  // second byte → bits 23-16
+            ((u8[i+2] || 0) <<  8) |  // third byte  → bits 15-8
+            ((u8[i+3] || 0))          // fourth byte → bits 7-0
+        );
+    }
+    return CryptoJS.lib.WordArray.create(words, u8.length);
+}
+```
+
+### `parseBitcoinHash(hashStr)` — Hash Parser
+
+```javascript
+function parseBitcoinHash(hashStr) {
+    // Example input:
+    // "$bitcoin$64$617c4b22...96$16$dff2b89e4d885c28$35714$2$00$2$00"
+
+    // Split: ["64", "617c4b22...96", "16", "dff2b89e4d885c28", "35714", ...]
+    const parts = hashStr.slice("$bitcoin$".length).split('$');
+
+    const mkHexLen   = parseInt(parts[0]);  // 64
+    const masterKey  = parts[1];            // "617c4b22...96" (64 chars)
+    const saltHexLen = parseInt(parts[2]);  // 16
+    const saltHex    = parts[3];            // "dff2b89e4d885c28" (16 chars)
+    const iterations = parseInt(parts[4]);  // 35714
+
+    // Validate: parts[1] must be parts[0] chars long (NOT parts[0]*2!)
+    if (masterKey.length !== mkHexLen) throw new Error("...");
+
+    return { masterKeyHex: masterKey, saltHex, iterations };
+}
+```
+
+### `deriveKeyBitcoinSHA512(password, saltBytes, iterations)` — Main KDF
+
+```javascript
+async function deriveKeyBitcoinSHA512(password, saltBytes, iterations) {
+    // Step 1: Encode password to bytes (UTF-8)
+    const passBytes = new TextEncoder().encode(password);
+
+    // Step 2: Combine password + salt
+    const combined = new Uint8Array(passBytes.length + saltBytes.length);
+    combined.set(passBytes, 0);
+    combined.set(saltBytes, passBytes.length);
+
+    // Step 3: First SHA-512 round (with pass+salt)
+    let hashBuf = await crypto.subtle.digest('SHA-512', combined);
+
+    // Step 4: SHA-512 iterations 2 through N (hash only)
+    for (let i = 1; i < iterations; i++) {
+        hashBuf = await crypto.subtle.digest('SHA-512', hashBuf);
+    }
+
+    // Output: 64 bytes
+    // [0..31]  = AES-256 key
+    // [32..47] = CBC IV
+    return new Uint8Array(hashBuf);
+}
+```
+
+---
+
+## 11. Comparison: Iterative SHA-512 vs PBKDF2 vs scrypt
+
+| Criteria              | Iterative SHA-512 (Bitcoin Core) | PBKDF2-SHA512     | scrypt              |
+|-----------------------|----------------------------------|-------------------|---------------------|
+| **Created**           | ~2009 (early Bitcoin)            | 2000 (RFC 2898)   | 2009                |
+| **GPU-resistant?**    | Low                              | Low-Medium        | High (memory-hard)  |
+| **ASIC-resistant?**   | No                               | No                | Yes                 |
+| **Implementation**    | Very simple                      | Medium            | Complex             |
+| **Parameters**        | iterations only                  | iter, keyLen      | N, r, p, keyLen     |
+| **Used in Bitcoin**   | wallet.dat encryption            | BIP39 seed        | Litecoin mining     |
+| **Output size**       | Fixed 64 bytes                   | Variable          | Variable            |
+| **Modern standard?**  | No (outdated)                    | Accepted          | Highly recommended  |
+
+**Conclusion:** The iterative SHA-512 used by Bitcoin Core is a legacy design from its early days (2009). For new systems, PBKDF2 or Argon2 (winner of the Password Hashing Competition 2015) is strongly recommended.
+
+---
+
+## 12. Security & Ethical Use
+
+### ✅ Permitted Use
+
+- Verifying the password of your own wallet that you forgot
+- Security research with written permission from the owner
+- Learning and cryptography education
+- Digital forensics with an official court order
+
+### ❌ Prohibited Use
+
+- Attempting to access someone else's wallet without permission
+- Brute-forcing a wallet that does not belong to you
+- Any form of digital asset theft
+
+### 🔒 Privacy of This Tool
+
+This tool is **100% client-side**. All computation happens in the user's browser. No data (hash, password, result) is sent to any server. You can verify this by inspecting the source code and monitoring network traffic in browser DevTools.
+
+---
+
+## 13. References & Further Reading
+
+| Source | Description |
+|--------|-------------|
+| `src/wallet/crypter.cpp` (Bitcoin Core) | Original implementation of KDF and wallet encryption |
+| RFC 2898 | PBKDF2 specification |
+| FIPS 197 | AES specification |
+| RFC 2315 | PKCS7 padding specification |
+| `bitcoin2john.py` (John the Ripper) | Tool for extracting hash from wallet.dat |
+| Hashcat mode 11300 | Bitcoin wallet hash format documentation |
+
+### Advanced Topics to Study
+
+- **BIP32/BIP39**: Hierarchical Deterministic Wallets and mnemonic seed phrases
+- **BIP38**: Private key encryption with scrypt (different from wallet.dat!)
+- **Argon2**: Modern KDF, winner of the Password Hashing Competition 2015
+- **Hardware Security Module (HSM)**: Enterprise-level cryptographic key storage
+
+---
+
+## Closing
+
+This tool and documentation were created for **educational purposes** — to help students and professionals understand how real cryptographic systems work behind a Bitcoin wallet. Understanding the bugs in incorrect implementations teaches us that cryptography that is "almost correct" is just as dangerous as using no cryptography at all.
+
+Happy learning! 🚀
+
+---
+
+## DONATIONS
+
+If this tool has been useful for your education and learning, donations are greatly appreciated:
+
+**Bitcoin (BTC):** `bc1qn6t8hy8memjfzp4y3sh6fvadjdtqj64vfvlx58`
+
+**Ethereum (ETH):** `0x512936ca43829C8f71017aE47460820Fe703CAea`
+
+**PayPal:** `syabiz@yandex.com`
+
+Donations will be used for developing new features, server maintenance, and documentation.
+
+---
+
+## CONTACT
+
+- **GitHub Issues:** https://github.com/syabiz/Bitcoin-Wallet-Checker/issues
+- **Email:** syabiz@yandex.com
+- **Twitter:** @syabiz
+
+---
+
+## ACKNOWLEDGEMENTS
+
+- **Bitcoin Community** — For technical documentation and specifications
+- **ecdsa developers** — For an excellent cryptography library
+- **base58 developers** — For efficient encoding/decoding
+- **All contributors** — Who helped improve this tool
+- **Users** — For valuable feedback and suggestions
+- **Donors** — For development costs, internet bills, and time
+
+---
+
+Thank you for using the Bitcoin Wallet Checker Tool! 🚀
+
+*Made with ❤️ for Bitcoin education and learning*
+
+*Last updated: February 19, 2026*
+
+---
+
+*Created for internal educational purposes. Please use responsibly.*

@@ -700,7 +700,7 @@ Donations will be used for developing new features, server maintenance, and docu
 
 ---
 
-## CONTACT
+## Contact
 
 - **GitHub Issues:** https://github.com/syabiz/Bitcoin-Wallet-Checker/issues
 - **Email:** syabiz@yandex.com
